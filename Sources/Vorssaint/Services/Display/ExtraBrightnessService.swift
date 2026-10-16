@@ -29,6 +29,30 @@ final class ExtraBrightnessService: ObservableObject {
     @Published private(set) var supported = false
     /// The boost is currently visible on the panel.
     @Published private(set) var boosting = false
+    /// What the boosted display's brightness slider needs to reach past 100 %.
+    @Published private(set) var sliderBoost: SliderBoost?
+    /// The luminance multiple on screen right now, to the hundredth: what the
+    /// slider's percent reads while the boost is on, since macOS may grant
+    /// less headroom than the slider asks for.
+    @Published private(set) var shownFactor = 1.0
+
+    struct SliderBoost: Equatable {
+        let displayID: UInt32
+        /// The headroom the display reports as possible in its current mode.
+        let potentialEDR: Double
+        let reference: Reference
+
+        /// The slider's top: the most the boost curve asks of this display.
+        var ceiling: Double {
+            ExtraBrightnessSupport.boostCeiling(reference: reference.tuple, grantedEDR: potentialEDR)
+        }
+    }
+
+    struct Reference: Equatable {
+        let referenceEDR: Double
+        let bonus: Double
+        var tuple: (referenceEDR: Double, bonus: Double) { (referenceEDR, bonus) }
+    }
 
     private var overlayWindow: NSWindow?
     private var overlayLayer: CAMetalLayer?
@@ -145,8 +169,108 @@ final class ExtraBrightnessService: ObservableObject {
     }
 
     private func refreshSupported() {
-        let now = Self.boostScreen() != nil
+        let screen = Self.boostScreen()
+        let now = screen != nil
         if supported != now { supported = now }
+        var next: SliderBoost?
+        if let screen, let id = Self.displayID(of: screen) {
+            let reference = Self.reference(for: screen)
+            next = SliderBoost(displayID: id,
+                               potentialEDR: Double(screen.maximumPotentialExtendedDynamicRangeColorComponentValue),
+                               reference: Reference(referenceEDR: reference.referenceEDR, bonus: reference.bonus))
+        }
+        if sliderBoost != next { sliderBoost = next }
+    }
+
+    // MARK: - Brightness slider past 100 %
+
+    private func sliderBoost(for display: BrightnessDisplay) -> SliderBoost? {
+        guard let sliderBoost, sliderBoost.displayID == display.id,
+              AppFeature.extraBrightness.isAvailable else { return nil }
+        return sliderBoost
+    }
+
+    /// Where the display's brightness slider sits: its hardware brightness,
+    /// or the luminance multiple the boost asks for while it is on.
+    func sliderPosition(for display: BrightnessDisplay) -> Double {
+        guard let boost = sliderBoost(for: display) else { return display.brightness }
+        let defaults = UserDefaults.standard
+        return ExtraBrightnessSupport.sliderPosition(
+            hardware: display.brightness,
+            boostEnabled: defaults.bool(forKey: DefaultsKey.extraBrightnessEnabled),
+            level: defaults.integer(forKey: DefaultsKey.extraBrightnessLevel),
+            grantedEDR: boost.potentialEDR, reference: boost.reference.tuple)
+    }
+
+    /// The percent shown beside the slider: the luminance multiple actually
+    /// on screen while the boost runs, otherwise the slider's own position.
+    func sliderPercent(for display: BrightnessDisplay) -> Int {
+        let position = sliderPosition(for: display)
+        guard position > ExtraBrightnessSupport.sliderBoostSnap, boosting,
+              sliderBoost(for: display) != nil else { return Int((position * 100).rounded()) }
+        return Int((shownFactor * 100).rounded())
+    }
+
+    /// The slider's top for this display: 1 (100 %), or the boost ceiling.
+    func sliderUpperBound(for display: BrightnessDisplay) -> Double {
+        sliderBoost(for: display)?.ceiling ?? 1
+    }
+
+    /// Applies a slider move: up to 100 % it is the hardware brightness with
+    /// the boost off; past it the hardware stays at full and the boost takes
+    /// the level that asks for that luminance multiple.
+    func setSliderPosition(_ position: Double, for display: BrightnessDisplay, showOSD: Bool) {
+        guard let boost = sliderBoost(for: display) else {
+            BrightnessService.shared.setBrightness(position, for: display.id, showOSD: showOSD)
+            return
+        }
+        let defaults = UserDefaults.standard
+        let wasEnabled = defaults.bool(forKey: DefaultsKey.extraBrightnessEnabled)
+        switch ExtraBrightnessSupport.sliderTarget(position: position, grantedEDR: boost.potentialEDR,
+                                                   reference: boost.reference.tuple) {
+        case .hardware(let value):
+            if wasEnabled {
+                defaults.set(false, forKey: DefaultsKey.extraBrightnessEnabled)
+                syncWithPreferences()
+            }
+            BrightnessService.shared.setBrightness(value, for: display.id, showOSD: showOSD)
+        case .boost(let level):
+            if display.brightness < 0.999 {
+                BrightnessService.shared.setBrightness(1, for: display.id, showOSD: false, announces: false)
+            }
+            defaults.set(level, forKey: DefaultsKey.extraBrightnessLevel)
+            if wasEnabled {
+                levelDidChange()
+            } else {
+                defaults.set(true, forKey: DefaultsKey.extraBrightnessEnabled)
+                syncWithPreferences()
+            }
+            announce(min(position, boost.ceiling), maximum: boost.ceiling, on: display.id, showOSD: showOSD)
+        }
+        objectWillChange.send()
+    }
+
+    /// A brightness key press on the boosted display, measured on the
+    /// slider's scale: from full hardware brightness an increase enters the
+    /// boost, and decreases leave it again at 100 % before the hardware
+    /// dims. Returns false when the press is the hardware's alone.
+    func handleKeyStep(delta: Double, for display: BrightnessDisplay, showOSD: Bool) -> Bool {
+        guard let boost = sliderBoost(for: display) else { return false }
+        let position = sliderPosition(for: display)
+        let enabled = UserDefaults.standard.bool(forKey: DefaultsKey.extraBrightnessEnabled)
+        guard let next = ExtraBrightnessSupport.keyStepPosition(from: position, delta: delta,
+                                                                ceiling: boost.ceiling,
+                                                                boostEnabled: enabled) else { return false }
+        setSliderPosition(next, for: display, showOSD: showOSD)
+        return true
+    }
+
+    /// Shows the boosted level the way the hardware path does: in the
+    /// Dynamic Island when it takes brightness, otherwise in the overlay
+    /// when that option is on.
+    private func announce(_ value: Double, maximum: Double, on id: UInt32, showOSD: Bool) {
+        let shownInNotch = NotchService.shared.showBrightness(value, maximum: maximum)
+        if showOSD, !shownInNotch { BrightnessOSD.show(displayID: id, brightness: value, maximum: maximum) }
     }
 
     // MARK: - Lifecycle
@@ -522,5 +646,7 @@ final class ExtraBrightnessService: ObservableObject {
         if waitUntilScheduled { commands.waitUntilScheduled() }
         let visible = factor > 1.001
         if boosting != visible { boosting = visible }
+        let shown = (factor * 100).rounded() / 100
+        if shownFactor != shown { shownFactor = shown }
     }
 }
