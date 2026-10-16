@@ -326,6 +326,32 @@ enum AppManagementFeatureTests {
         suite.expect(!ExtraBrightnessSupport.isXDRPanelName("Built-in Liquid Retina Display")
                && !ExtraBrightnessSupport.isXDRPanelName("Built-in Retina Display"),
                "generic built-in panel names do not qualify by name")
+
+        // External HDR displays (an AW3423DW reports 4.27 with HDR on, 1.0 off).
+        suite.expect(ExtraBrightnessSupport.isSupportedExternal(potentialEDR: 4.27)
+               && !ExtraBrightnessSupport.isSupportedExternal(potentialEDR: 1.0)
+               && !ExtraBrightnessSupport.isSupportedExternal(potentialEDR: 2.0),
+               "an external display qualifies only with real HDR headroom")
+        typealias Candidate = ExtraBrightnessSupport.Candidate
+        suite.expect(ExtraBrightnessSupport.boostTarget([
+                    Candidate(id: 3, isBuiltin: false, isSupported: true),
+                    Candidate(id: 1, isBuiltin: true, isSupported: true)]) == 1
+               && ExtraBrightnessSupport.boostTarget([
+                    Candidate(id: 1, isBuiltin: true, isSupported: false),
+                    Candidate(id: 3, isBuiltin: false, isSupported: true)]) == 3
+               && ExtraBrightnessSupport.boostTarget([
+                    Candidate(id: 3, isBuiltin: false, isSupported: false)]) == nil,
+               "the built-in XDR panel keeps the boost; an HDR external takes it otherwise")
+        let external = ExtraBrightnessSupport.externalReference(potentialEDR: 4.27)
+        suite.expect(external.bonus == 1.0 && external.referenceEDR == 2.0,
+               "a 1000 nit HDR monitor tops out at twice SDR white")
+        suite.expect(abs(ExtraBrightnessSupport.externalReference(potentialEDR: 2.5).bonus - 0.75) < 0.0001,
+               "a monitor with little headroom gets at most half of it")
+        suite.expect(ExtraBrightnessSupport.renderFactor(level: 1, currentEDR: 4.27, potentialEDR: 4.27,
+                                                         reference: external) == 2.0
+               && ExtraBrightnessSupport.renderFactor(level: 1, currentEDR: 1.2, potentialEDR: 4.27,
+                                                      reference: external) == 1.2,
+               "the external boost reaches twice SDR white, never past the headroom granted so far")
         suite.expect(abs(ExtraBrightnessSupport.rampedFactor(previous: 1.0, target: 1.48) - 1.03) < 0.0001,
                "the factor climbs one small step per tick")
         suite.expect(ExtraBrightnessSupport.rampedFactor(previous: 1.46, target: 1.48) == 1.48,

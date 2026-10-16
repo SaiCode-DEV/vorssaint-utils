@@ -65,6 +65,41 @@ enum ExtraBrightnessSupport {
         return potentialEDR > capabilityFloor || isXDRPanelName(localizedName)
     }
 
+    /// Whether an external display can exceed its SDR white. An SDR monitor
+    /// reports a potential headroom of 1.0; one running in HDR mode reports
+    /// its peak over SDR white (4.27 on a Dell AW3423DW at 100 Hz). External
+    /// panels never fake EDR by dimming, but the same floor keeps a display
+    /// with marginal headroom out.
+    static func isSupportedExternal(potentialEDR: Double) -> Bool {
+        potentialEDR > capabilityFloor
+    }
+
+    /// One screen as the target choice sees it.
+    struct Candidate: Equatable {
+        let id: UInt32
+        let isBuiltin: Bool
+        let isSupported: Bool
+    }
+
+    /// The display the boost goes to: a supported built-in XDR panel first,
+    /// as before, otherwise the first supported external display. One overlay
+    /// serves one display.
+    static func boostTarget(_ candidates: [Candidate]) -> UInt32? {
+        candidates.first { $0.isBuiltin && $0.isSupported }?.id
+            ?? candidates.first { !$0.isBuiltin && $0.isSupported }?.id
+    }
+
+    /// External HDR monitors publish no sustainable full-screen level and
+    /// most limit full-field brightness on their own (OLED ABL), so the boost
+    /// stays modest: at most twice SDR white, never past half of the
+    /// display's potential headroom, and reached once macOS grants that much.
+    static let externalMaxBonus: Double = 1.0
+
+    static func externalReference(potentialEDR: Double) -> (referenceEDR: Double, bonus: Double) {
+        let bonus = min(externalMaxBonus, max((potentialEDR - 1) / 2, 0))
+        return (1 + bonus, bonus)
+    }
+
     /// The 2021 and 2023 M1/M2 MacBook Pro panels reference 500 nits in SDR;
     /// the M3 generation onwards references 600 (the reference is the panel's
     /// 1600 nit peak over its SDR maximum). The pair per generation is

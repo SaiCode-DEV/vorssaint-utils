@@ -5,8 +5,9 @@ import AppKit
 import Metal
 import QuartzCore
 
-/// Pushes the built-in XDR display past its regular maximum brightness by
-/// using the panel's HDR headroom for everything on screen.
+/// Pushes the built-in XDR display, or else an external display running in
+/// HDR mode, past its regular maximum brightness by using the panel's HDR
+/// headroom for everything on screen.
 ///
 /// Mechanism: a fullscreen, click-through overlay window holds a Metal layer
 /// whose compositing filter is "multiply". The layer renders a solid gray
@@ -24,7 +25,7 @@ import QuartzCore
 final class ExtraBrightnessService: ObservableObject {
     static let shared = ExtraBrightnessService()
 
-    /// A built-in display with EDR headroom exists (feature can work here).
+    /// A built-in XDR panel or an external HDR display exists (feature can work here).
     @Published private(set) var supported = false
     /// The boost is currently visible on the panel.
     @Published private(set) var boosting = false
@@ -100,22 +101,38 @@ final class ExtraBrightnessService: ObservableObject {
     /// Which sustainable boost curve this panel generation takes.
     private static let panelReference = ExtraBrightnessSupport.panelReference(model: modelIdentifier)
 
-    private static func builtInXDRScreen() -> NSScreen? {
-        NSScreen.screens.first { screen in
-            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-            else { return false }
-            return CGDisplayIsBuiltin(number.uint32Value) != 0
-                && ExtraBrightnessSupport.isSupportedPanel(
-                    model: modelIdentifier,
-                    localizedName: screen.localizedName,
-                    potentialEDR: Double(screen.maximumPotentialExtendedDynamicRangeColorComponentValue))
+    /// The screen the boost goes to: the built-in XDR panel when there is
+    /// one, otherwise an external display with HDR headroom (in practice one
+    /// with HDR turned on, since an SDR monitor reports none).
+    private static func boostScreen() -> NSScreen? {
+        let screens = NSScreen.screens.compactMap { screen -> (NSScreen, ExtraBrightnessSupport.Candidate)? in
+            guard let id = displayID(of: screen) else { return nil }
+            let potential = Double(screen.maximumPotentialExtendedDynamicRangeColorComponentValue)
+            let builtin = CGDisplayIsBuiltin(id) != 0
+            let supported = builtin
+                ? ExtraBrightnessSupport.isSupportedPanel(model: modelIdentifier,
+                                                          localizedName: screen.localizedName,
+                                                          potentialEDR: potential)
+                : ExtraBrightnessSupport.isSupportedExternal(potentialEDR: potential)
+            return (screen, .init(id: id, isBuiltin: builtin, isSupported: supported))
         }
+        guard let target = ExtraBrightnessSupport.boostTarget(screens.map(\.1)) else { return nil }
+        return screens.first { $0.1.id == target }?.0
+    }
+
+    /// The boost curve for a screen: the panel generation's for the built-in
+    /// display, a modest one derived from the reported headroom for an
+    /// external display.
+    private static func reference(for screen: NSScreen) -> (referenceEDR: Double, bonus: Double) {
+        guard let id = displayID(of: screen), CGDisplayIsBuiltin(id) == 0 else { return panelReference }
+        return ExtraBrightnessSupport.externalReference(
+            potentialEDR: Double(screen.maximumPotentialExtendedDynamicRangeColorComponentValue))
     }
 
     /// The screen the overlay was built for. Which panel qualifies moves only
     /// with the display topology, and `didChangeScreenParametersNotification`
     /// already tracks that into `overlayDisplayID`, so the poll looks the
-    /// display up instead of re-deriving it with `builtInXDRScreen()` four
+    /// display up instead of re-deriving it with `boostScreen()` four
     /// times a second. Both walk `NSScreen.screens` reading
     /// `deviceDescription`; what this drops is the per-screen
     /// `CGDisplayIsBuiltin` call and, on the built-in panel, `localizedName`
@@ -128,7 +145,7 @@ final class ExtraBrightnessService: ObservableObject {
     }
 
     private func refreshSupported() {
-        let now = Self.builtInXDRScreen() != nil
+        let now = Self.boostScreen() != nil
         if supported != now { supported = now }
     }
 
@@ -136,7 +153,7 @@ final class ExtraBrightnessService: ObservableObject {
 
     private func start() {
         guard pollTimer == nil else { return }
-        guard let screen = Self.builtInXDRScreen() else { return }
+        guard let screen = Self.boostScreen() else { return }
         showOverlay(on: screen)
         installObserver()
         // Four presents a second: the headroom grant follows recent extended
@@ -214,10 +231,10 @@ final class ExtraBrightnessService: ObservableObject {
     /// The pair is resident on every Space, so a desktop or fullscreen change
     /// normally needs nothing beyond a fresh present. Rebuilding stays as the
     /// fallback for what can still move the ground under it: a different
-    /// built-in display, or AppKit reporting that a window is not there.
+    /// target display, or AppKit reporting that a window is not there.
     private func handleActiveSpaceChange() {
         guard pollTimer != nil else { return }
-        guard let screen = Self.builtInXDRScreen() else {
+        guard let screen = Self.boostScreen() else {
             handleScreenChange()
             return
         }
@@ -241,9 +258,10 @@ final class ExtraBrightnessService: ObservableObject {
             stop()
             return
         }
-        guard let screen = Self.builtInXDRScreen() else {
-            // Built-in display gone (clamshell): release everything; the
-            // preference stays on and a later screen change brings it back.
+        guard let screen = Self.boostScreen() else {
+            // No display left to boost (clamshell, HDR turned off): release
+            // everything; the preference stays on and a later screen change
+            // brings it back.
             stop(preservingObservers: true)
             return
         }
@@ -470,7 +488,7 @@ final class ExtraBrightnessService: ObservableObject {
         disengagedTicks = engaged ? 0 : disengagedTicks + 1
         let instantaneous = ExtraBrightnessSupport.renderFactor(level: level, currentEDR: headroom,
                                                                 potentialEDR: potential,
-                                                                reference: Self.panelReference)
+                                                                reference: Self.reference(for: screen))
         if immediate {
             renderedFactor = instantaneous
         } else {
